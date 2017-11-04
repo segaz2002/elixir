@@ -1,7 +1,7 @@
 defmodule Supervisor.Default do
   @moduledoc false
 
-  def init({children, opts}) do
-    Supervisor.init(children, opts)
+  def init({module, children, opts}) do
+    module.init(children, opts)
   end
 end

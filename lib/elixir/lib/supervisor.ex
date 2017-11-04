@@ -544,7 +544,7 @@ defmodule Supervisor do
           | {:max_seconds, pos_integer}
 
   @typedoc "Supported strategies"
-  @type strategy :: :simple_one_for_one | :one_for_one | :one_for_all | :rest_for_one
+  @type strategy :: :one_for_one | :one_for_all | :rest_for_one
 
   # Note we have inlined all types for readability
   @typedoc "The supervisor specification"
@@ -589,7 +589,7 @@ defmodule Supervisor do
   @spec start_link([:supervisor.child_spec() | {module, term} | module], options) :: on_start
   def start_link(children, options) when is_list(children) do
     {sup_opts, start_opts} = Keyword.split(options, [:strategy, :max_seconds, :max_restarts])
-    start_link(Supervisor.Default, {children, sup_opts}, start_opts)
+    start_link(Supervisor.Default, {__MODULE__, children, sup_opts}, start_opts)
   end
 
   @doc """
@@ -790,7 +790,6 @@ defmodule Supervisor do
   name, the supported values are described in the "Name registration"
   section in the `GenServer` module docs.
   """
-  @spec start_link(module, term) :: on_start
   @spec start_link(module, term, GenServer.options()) :: on_start
   def start_link(module, arg, options \\ []) when is_list(options) do
     case Keyword.get(options, :name) do
