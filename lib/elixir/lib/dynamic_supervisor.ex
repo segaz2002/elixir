@@ -52,7 +52,6 @@ defmodule DynamicSupervisor do
     :max_dynamic,
     children: %{},
     restarts: [],
-    restarting: 0,
     dynamic: 0
   ]
 
@@ -248,8 +247,12 @@ defmodule DynamicSupervisor do
 
   defp validate_template([template] = children) do
     case :supervisor.check_childspecs(children) do
-      :ok -> {:ok, template}
-      {:error, reason} -> {:error, {:start_spec, reason}}
+      :ok ->
+        {_, mfa, restart, shutdown, type, modules} = template
+        {:ok, {mfa, restart, shutdown, type, modules}}
+
+      {:error, reason} ->
+        {:error, {:start_spec, reason}}
     end
   end
 
@@ -272,39 +275,42 @@ defmodule DynamicSupervisor do
 
   @impl true
   def handle_call(:which_children, _from, state) do
-    %{children: children, template: child} = state
-    {_, _, _, _, type, mods} = child
+    %{children: children} = state
 
     reply =
       for {pid, args} <- children do
-        maybe_pid =
-          case args do
-            {:restarting, _} -> :restarting
-            _ -> pid
-          end
+        case args do
+          {:restarting, {_, _, _, type, modules}} ->
+            {:undefined, :restarting, type, modules}
 
-        {:undefined, maybe_pid, type, mods}
+          {_, _, _, type, modules} ->
+            {:undefined, pid, type, modules}
+        end
       end
 
     {:reply, reply, state}
   end
 
   def handle_call(:count_children, _from, state) do
-    %{children: children, template: child, restarting: restarting} = state
-    {_, _, _, _, type, _} = child
-
+    %{children: children} = state
     specs = map_size(children)
-    active = specs - restarting
 
-    reply =
-      case type do
-        :supervisor ->
-          %{specs: 1, active: active, workers: 0, supervisors: specs}
+    {active, workers, supervisors} =
+      Enum.reduce(children, {0, 0, 0}, fn
+        {_pid, {:restarting, {_, _, _, :worker, _}}}, {active, worker, supervisor} ->
+          {active, worker + 1, supervisor}
 
-        :worker ->
-          %{specs: 1, active: active, workers: specs, supervisors: 0}
-      end
+        {_pid, {:restarting, {_, _, _, :supervisor, _}}}, {active, worker, supervisor} ->
+          {active, worker, supervisor + 1}
 
+        {_pid, {_, _, _, :worker, _}}, {active, worker, supervisor} ->
+          {active + 1, worker + 1, supervisor}
+
+        {_pid, {_, _, _, :supervisor, _}}, {active, worker, supervisor} ->
+          {active + 1, worker, supervisor + 1}
+      end)
+
+    reply = %{specs: specs, active: active, workers: workers, supervisors: supervisors}
     {:reply, reply, state}
   end
 
@@ -329,15 +335,15 @@ defmodule DynamicSupervisor do
     end
   end
 
-  defp handle_start_child({_, {m, f, args}, restart, _, _, _}, extra, state) do
+  defp handle_start_child({{m, f, args}, restart, shutdown, type, modules}, extra, state) do
     args = args ++ extra
 
     case reply = start_child(m, f, args) do
       {:ok, pid, _} ->
-        {:reply, reply, save_child(restart, pid, args, state)}
+        {:reply, reply, save_child(pid, {m, f, args}, restart, shutdown, type, modules, state)}
 
       {:ok, pid} ->
-        {:reply, reply, save_child(restart, pid, args, state)}
+        {:reply, reply, save_child(pid, {m, f, args}, restart, shutdown, type, modules, state)}
 
       _ ->
         {:reply, reply, update_in(state.dynamic, &(&1 - 1))}
@@ -359,8 +365,13 @@ defmodule DynamicSupervisor do
     end
   end
 
-  defp save_child(:temporary, pid, _, state), do: put_in(state.children[pid], :undefined)
-  defp save_child(_, pid, args, state), do: put_in(state.children[pid], args)
+  defp save_child(pid, {m, f, _}, :temporary, shutdown, type, modules, state) do
+    put_in(state.children[pid], {{m, f, :undefined}, :temporary, shutdown, type, modules})
+  end
+
+  defp save_child(pid, mfa, restart, shutdown, type, modules, state) do
+    put_in(state.children[pid], {mfa, restart, shutdown, type, modules})
+  end
 
   defp exit_reason(:exit, reason, _), do: reason
   defp exit_reason(:error, reason, stack), do: {reason, stack}
@@ -374,28 +385,21 @@ defmodule DynamicSupervisor do
   @impl true
   def handle_info({:EXIT, pid, reason}, state) do
     case maybe_restart_child(pid, reason, state) do
-      {:ok, state} ->
-        {:noreply, state}
-
-      {:shutdown, state} ->
-        {:stop, :shutdown, state}
+      {:ok, state} -> {:noreply, state}
+      {:shutdown, state} -> {:stop, :shutdown, state}
     end
   end
 
   def handle_info({:"$gen_restart", pid}, state) do
-    %{children: children, template: child, restarting: restarting} = state
-    state = %{state | restarting: restarting - 1}
+    %{children: children, template: child} = state
 
     case children do
       %{^pid => restarting_args} ->
-        {:restarting, args} = restarting_args
+        {:restarting, child} = restarting_args
 
-        case restart_child(pid, args, child, state) do
-          {:ok, state} ->
-            {:noreply, state}
-
-          {:shutdown, state} ->
-            {:stop, :shutdown, state}
+        case restart_child(pid, child, state) do
+          {:ok, state} -> {:noreply, state}
+          {:shutdown, state} -> {:stop, :shutdown, state}
         end
 
       # We may hit clause if we send $gen_restart and then
@@ -438,50 +442,40 @@ defmodule DynamicSupervisor do
     :ok = terminate_children(children, state)
   end
 
-  defp terminate_children(children, %{template: template} = state) do
-    {_, _, restart, shutdown, _, _} = template
-
-    {pids, stacks} = monitor_children(children, restart)
+  defp terminate_children(children, state) do
+    {pids, times, stacks} = monitor_children(children)
     size = map_size(pids)
 
-    stacks =
-      case shutdown do
-        :brutal_kill ->
-          for {pid, _} <- pids, do: Process.exit(pid, :kill)
-          wait_children(restart, shutdown, pids, size, nil, stacks)
+    timers =
+      Enum.reduce(times, %{}, fn {time, pids}, acc ->
+        Map.put(acc, :erlang.start_timer(time, self(), :kill), pids)
+      end)
 
-        :infinity ->
-          for {pid, _} <- pids, do: Process.exit(pid, :shutdown)
-          wait_children(restart, shutdown, pids, size, nil, stacks)
+    stacks = wait_children(pids, size, timers, stacks)
 
-        time ->
-          for {pid, _} <- pids, do: Process.exit(pid, :shutdown)
-          timer = :erlang.start_timer(time, self(), :kill)
-          wait_children(restart, shutdown, pids, size, timer, stacks)
-      end
-
-    for {pid, reason} <- stacks do
-      report_error(:shutdown_error, reason, pid, :undefined, template, state)
+    for {pid, {child, reason}} <- stacks do
+      report_error(:shutdown_error, reason, pid, child, state)
     end
 
     :ok
   end
 
-  defp monitor_children(children, restart) do
-    Enum.reduce(children, {%{}, %{}}, fn
-      {_, {:restarting, _}}, {pids, stacks} ->
-        {pids, stacks}
+  defp monitor_children(children) do
+    Enum.reduce(children, {%{}, %{}, %{}}, fn
+      {_, {:restarting, _}}, acc ->
+        acc
 
-      {pid, _}, {pids, stacks} ->
+      {pid, {_, restart, _, _, _} = child}, {pids, times, stacks} ->
         case monitor_child(pid) do
           :ok ->
-            {Map.put(pids, pid, true), stacks}
+            times = exit_child(pid, child, times)
+            {Map.put(pids, pid, child), times, stacks}
 
           {:error, :normal} when restart != :permanent ->
-            {pids, stacks}
+            {pids, times, stacks}
 
           {:error, reason} ->
-            {pids, Map.put(stacks, pid, reason)}
+            {pids, times, Map.put(stacks, pid, {child, reason})}
         end
     end)
   end
@@ -500,85 +494,103 @@ defmodule DynamicSupervisor do
     end
   end
 
-  defp wait_children(_restart, _shutdown, _pids, 0, nil, stacks) do
-    stacks
+  defp exit_child(pid, {_, _, shutdown, _, _}, times) do
+    case shutdown do
+      :brutal_kill ->
+        Process.exit(pid, :kill)
+        times
+
+      :infinity ->
+        Process.exit(pid, :shutdown)
+        times
+
+      time ->
+        Process.exit(pid, :shutdown)
+        Map.update(times, time, [pid], &[pid | &1])
+    end
   end
 
-  defp wait_children(_restart, _shutdown, _pids, 0, timer, stacks) do
-    _ = :erlang.cancel_timer(timer)
+  defp wait_children(_pids, 0, timers, stacks) do
+    for {timer, _} <- timers do
+      _ = :erlang.cancel_timer(timer)
 
-    receive do
-      {:timeout, ^timer, :kill} -> :ok
-    after
-      0 -> :ok
+      receive do
+        {:timeout, ^timer, :kill} -> :ok
+      after
+        0 -> :ok
+      end
     end
 
     stacks
   end
 
-  defp wait_children(restart, :brutal_kill, pids, size, timer, stacks) do
+  defp wait_children(pids, size, timers, stacks) do
     receive do
-      {:DOWN, _ref, :process, pid, :killed} ->
-        wait_children(restart, :brutal_kill, Map.delete(pids, pid), size - 1, timer, stacks)
-
       {:DOWN, _ref, :process, pid, reason} ->
-        stacks = Map.put(stacks, pid, reason)
-        wait_children(restart, :brutal_kill, Map.delete(pids, pid), size - 1, timer, stacks)
+        case pids do
+          %{^pid => child} ->
+            stacks = wait_child(pid, child, reason, stacks)
+            wait_children(pids, size - 1, timers, stacks)
+
+          %{} ->
+            wait_children(pids, size, timers, stacks)
+        end
+
+      {:timeout, timer, :kill} ->
+        for pid <- Map.fetch!(timers, timer), do: Process.exit(pid, :kill)
+        wait_children(pids, size, Map.delete(timers, timer), stacks)
     end
   end
 
-  defp wait_children(restart, shutdown, pids, size, timer, stacks) do
-    receive do
-      {:DOWN, _ref, :process, pid, :shutdown} ->
-        wait_children(restart, shutdown, Map.delete(pids, pid), size - 1, timer, stacks)
-
-      {:DOWN, _ref, :process, pid, :normal} when restart != :permanent ->
-        wait_children(restart, shutdown, Map.delete(pids, pid), size - 1, timer, stacks)
-
-      {:DOWN, _ref, :process, pid, reason} ->
-        stacks = Map.put(stacks, pid, reason)
-        wait_children(restart, shutdown, Map.delete(pids, pid), size - 1, timer, stacks)
-
-      {:timeout, ^timer, :kill} ->
-        for {pid, _} <- pids, do: Process.exit(pid, :kill)
-        wait_children(restart, shutdown, pids, size, nil, stacks)
+  defp wait_child(pid, {_, _, :brutal_kill, _, _} = child, reason, stacks) do
+    case reason do
+      :killed -> stacks
+      _ -> Map.put(stacks, pid, {child, reason})
     end
   end
 
-  defp maybe_restart_child(pid, reason, state) do
-    %{children: children, template: child} = state
-    {_, _, restart, _, _, _} = child
+  defp wait_child(pid, {_, restart, _, _, _} = child, reason, stacks) do
+    case reason do
+      :shutdown -> stacks
+      :normal when restart != :permanent -> stacks
+      reason -> Map.put(stacks, pid, {child, reason})
+    end
+  end
 
+  defp maybe_restart_child(pid, reason, %{children: children} = state) do
     case children do
-      %{^pid => args} -> maybe_restart_child(restart, reason, pid, args, child, state)
-      %{} -> {:ok, state}
+      %{^pid => {_, restart, _, _, _} = child} ->
+        maybe_restart_child(restart, reason, pid, child, state)
+
+      %{} ->
+        {:ok, state}
     end
   end
 
-  defp maybe_restart_child(:permanent, reason, pid, args, child, state) do
-    report_error(:child_terminated, reason, pid, args, child, state)
-    restart_child(pid, args, child, state)
+  defp maybe_restart_child(:permanent, reason, pid, child, state) do
+    report_error(:child_terminated, reason, pid, child, state)
+    restart_child(pid, child, state)
   end
 
-  defp maybe_restart_child(_, :normal, pid, _args, _child, state) do
+  defp maybe_restart_child(_, :normal, pid, _child, state) do
     {:ok, delete_child(pid, state)}
   end
 
-  defp maybe_restart_child(_, :shutdown, pid, _args, _child, state) do
+  defp maybe_restart_child(_, :shutdown, pid, _child, state) do
     {:ok, delete_child(pid, state)}
   end
 
-  defp maybe_restart_child(_, {:shutdown, _}, pid, _args, _child, state) do
+  defp maybe_restart_child(_, {:shutdown, _}, pid, _child, state) do
     {:ok, delete_child(pid, state)}
   end
 
-  defp maybe_restart_child(:transient, reason, pid, args, child, state) do
-    report_error(:child_terminated, reason, pid, args, child, state)
-    restart_child(pid, args, child, state)
+  defp maybe_restart_child(:transient, reason, pid, child, state) do
+    report_error(:child_terminated, reason, pid, child, state)
+    restart_child(pid, child, state)
   end
 
-  defp maybe_restart_child(:temporary, reason, pid, args, child, state) do
-    report_error(:child_terminated, reason, pid, args, child, state)
+  defp maybe_restart_child(:temporary, reason, pid, child, state) do
+    report_error(:child_terminated, reason, pid, child, state)
     {:ok, delete_child(pid, state)}
   end
 
@@ -587,10 +599,10 @@ defmodule DynamicSupervisor do
     %{state | children: Map.delete(children, pid), dynamic: dynamic - 1}
   end
 
-  defp restart_child(pid, args, child, state) do
+  defp restart_child(pid, child, state) do
     case add_restart(state) do
       {:ok, %{strategy: strategy} = state} ->
-        case restart_child(strategy, pid, args, child, state) do
+        case restart_child(strategy, pid, child, state) do
           {:ok, state} ->
             {:ok, state}
 
@@ -600,7 +612,7 @@ defmodule DynamicSupervisor do
         end
 
       {:shutdown, state} ->
-        report_error(:shutdown, :reached_max_restart_intensity, pid, args, child, state)
+        report_error(:shutdown, :reached_max_restart_intensity, pid, child, state)
         {:shutdown, delete_child(pid, state)}
     end
   end
@@ -622,51 +634,43 @@ defmodule DynamicSupervisor do
     for then <- restarts, now <= then + period, do: then
   end
 
-  defp restart_child(:one_for_one, current_pid, args, child, state) do
-    {_, {m, f, _}, restart, _, _, _} = child
+  defp restart_child(:one_for_one, current_pid, child, state) do
+    {{m, f, args} = mfa, restart, shutdown, type, modules} = child
 
     case start_child(m, f, args) do
       {:ok, pid, _} ->
-        {:ok, save_child(restart, pid, args, delete_child(current_pid, state))}
+        state = delete_child(current_pid, state)
+        {:ok, save_child(pid, mfa, restart, shutdown, type, modules, state)}
 
       {:ok, pid} ->
-        {:ok, save_child(restart, pid, args, delete_child(current_pid, state))}
+        state = delete_child(current_pid, state)
+        {:ok, save_child(pid, mfa, restart, shutdown, type, modules, state)}
 
       :ignore ->
         {:ok, delete_child(current_pid, state)}
 
       {:error, reason} ->
-        report_error(:start_error, reason, {:restarting, current_pid}, args, child, state)
-        state = restart_child(current_pid, state)
-        {:try_again, update_in(state.restarting, &(&1 + 1))}
+        report_error(:start_error, reason, {:restarting, current_pid}, child, state)
+        state = put_in(state.children[current_pid], {:restarting, child})
+        {:try_again, state}
     end
   end
 
-  defp restart_child(pid, %{children: children} = state) do
-    case children do
-      %{^pid => {:restarting, _}} ->
-        state
-
-      %{^pid => args} ->
-        %{state | children: Map.put(children, pid, {:restarting, args})}
-    end
-  end
-
-  defp report_error(error, reason, pid, args, child, %{name: name}) do
+  defp report_error(error, reason, pid, child, %{name: name}) do
     :error_logger.error_report(
       :supervision_report,
       supervisor: name,
       errorContext: error,
       reason: reason,
-      offender: extract_child(pid, args, child)
+      offender: extract_child(pid, child)
     )
   end
 
-  defp extract_child(pid, args, {id, {m, f, _}, restart, shutdown, type, _}) do
+  defp extract_child(pid, {mfa, restart, shutdown, type, _modules}) do
     [
       pid: pid,
-      id: id,
-      mfargs: {m, f, args},
+      id: :undefined,
+      mfargs: mfa,
       restart_type: restart,
       shutdown: shutdown,
       child_type: type
